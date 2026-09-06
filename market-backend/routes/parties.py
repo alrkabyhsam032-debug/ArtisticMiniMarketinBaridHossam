@@ -82,8 +82,14 @@ def get_customer(customer_id: str, db = Depends(get_db), _u = Depends(get_curren
         raise HTTPException(status_code=404, detail="Customer not found")
     totals = customer_account_totals(db, customer_id)
     # Last activity: max of last sale or payment date
-    last_sale = db[C.sales].find_one({"customer_id": customer_id}, sort=[("created_at", -1)])
-    last_pay = db[C.customer_payments].find_one({"customer_id": customer_id}, sort=[("created_at", -1)])
+    last_sale_rows = list(
+        db[C.sales].find({"customer_id": customer_id}).sort("created_at", -1).limit(1)
+    )
+    last_pay_rows = list(
+        db[C.customer_payments].find({"customer_id": customer_id}).sort("created_at", -1).limit(1)
+    )
+    last_sale = last_sale_rows[0] if last_sale_rows else None
+    last_pay = last_pay_rows[0] if last_pay_rows else None
     dates = [d.get("created_at") for d in [last_sale, last_pay] if d and d.get("created_at")]
     last_activity = max(dates) if dates else None
     return {
