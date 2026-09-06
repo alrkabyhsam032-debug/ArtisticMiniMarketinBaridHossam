@@ -4,6 +4,7 @@ import json
 import os
 import logging
 import re
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -21,7 +22,7 @@ from models import new_id
 from utils.deps import require_admin
 from utils.audit import log_action
 from utils.security import verify_password
-from utils.google_drive import GoogleDriveError, upload_backup
+from utils.google_drive import GoogleDriveClient, GoogleDriveError, upload_backup
 
 router = APIRouter(prefix="/api/admin/backups", tags=["backups"])
 logger = logging.getLogger(__name__)
@@ -337,6 +338,76 @@ def _restore_collections(db, col_data: dict) -> tuple[int, int, list[str]]:
     return restored_collections, restored_documents, failures
 
 
+def _restore_backup_file(
+    filename: str,
+    filepath: Path,
+    payload: "RestorePayload",
+    request: Request,
+    db,
+    current,
+    source: str = "local",
+):
+    """Restore one validated archive while keeping the safety checks in one place."""
+    if not _valid_name(filename):
+        raise HTTPException(400, "اسم ملف النسخة غير صحيح")
+    if payload.confirm != "RESTORE_DATABASE":
+        raise HTTPException(400, "عبارة التأكيد غير صحيحة")
+    if not verify_password(payload.current_password, current["password_hash"]):
+        raise HTTPException(401, "كلمة المرور غير صحيحة")
+    if not filename.endswith(".json.gz"):
+        raise HTTPException(400, "الاستعادة متاحة فقط لملفات .json.gz")
+    if not filepath.exists():
+        raise HTTPException(404, "ملف النسخة غير موجود")
+
+    safety_name = "FAILED"
+    try:
+        safety_name = _do_backup(db, trigger="safety").name
+    except Exception:
+        pass
+
+    try:
+        with gzip.open(str(filepath), "rt", encoding="utf-8") as fh:
+            backup = json.load(fh)
+    except Exception as exc:
+        raise HTTPException(400, f"تعذّر قراءة ملف النسخة الاحتياطية: {exc}")
+
+    col_data = backup.get("data", {})
+    try:
+        restored, documents_restored, failures = _restore_collections(db, col_data)
+    except Exception as exc:
+        raise HTTPException(400, f"بيانات النسخة غير صالحة: {exc}")
+    if failures:
+        raise HTTPException(
+            500,
+            "تعذّرت استعادة بعض مجموعات البيانات: " + ", ".join(failures)
+            + f". تم إنشاء نسخة الأمان: {safety_name}",
+        )
+
+    log_action(
+        db,
+        current["_id"],
+        "restore_success",
+        "system",
+        None,
+        after={
+            "file": filename,
+            "source": source,
+            "safety_backup": safety_name,
+            "collections_restored": restored,
+            "documents_restored": documents_restored,
+        },
+        request=request,
+    )
+    return {
+        "detail": "✅ تمت استعادة جميع بيانات النظام بنجاح — يرجى تسجيل الدخول من جديد",
+        "restored_from": filename,
+        "source": source,
+        "collections_restored": restored,
+        "documents_restored": documents_restored,
+        "safety_backup_created": safety_name,
+    }
+
+
 def _auto_backup_job(trigger: str = "auto"):
     """Scheduled job — gets its own DB reference."""
     global _last_auto_error
@@ -577,6 +648,81 @@ def sync_drive(_u=Depends(require_admin)):
     return _sync_pending_to_drive()
 
 
+@router.get("/drive")
+def list_drive_backups(_u=Depends(require_admin)):
+    try:
+        state = _load_drive_state()
+        files = GoogleDriveClient().list_backup_files(state.get("folder_id"))
+        return [
+            {
+                "id": file.get("id"),
+                "name": file.get("name"),
+                "size": int(file.get("size") or 0),
+                "size_human": _human(int(file.get("size") or 0)),
+                "modified_time": file.get("modifiedTime"),
+                "web_view_link": file.get("webViewLink"),
+            }
+            for file in files
+        ]
+    except GoogleDriveError as exc:
+        raise HTTPException(502, str(exc))
+    except Exception as exc:
+        logger.exception("Google Drive listing failed")
+        raise HTTPException(502, f"تعذر تحميل نسخ Google Drive: {str(exc)[:300]}")
+
+
+@router.post("/drive/restore/{file_id}")
+def restore_from_drive(
+    file_id: str,
+    payload: "RestorePayload",
+    request: Request,
+    db=Depends(get_db),
+    current=Depends(require_admin),
+):
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,200}", file_id):
+        raise HTTPException(400, "معرّف نسخة Google Drive غير صحيح")
+    try:
+        state = _load_drive_state()
+        client = GoogleDriveClient()
+        files = client.list_backup_files(state.get("folder_id"))
+        selected = next((file for file in files if file.get("id") == file_id), None)
+        if not selected:
+            raise HTTPException(404, "النسخة غير موجودة في مجلد النسخ")
+        filename = selected.get("name", "")
+        if not _valid_name(filename):
+            raise HTTPException(400, "اسم ملف النسخة غير مدعوم")
+        content = client.download_file(file_id)
+        if len(content) > 100 * 1024 * 1024:
+            raise HTTPException(413, "حجم النسخة أكبر من الحد المسموح")
+        BACKUP_DIR.mkdir(exist_ok=True, parents=True)
+        with tempfile.NamedTemporaryFile(
+            dir=BACKUP_DIR,
+            prefix=f".{filename}.",
+            suffix=".download",
+            delete=False,
+        ) as temporary:
+            temporary.write(content)
+            temporary_path = Path(temporary.name)
+        local_path = BACKUP_DIR / filename
+        temporary_path.replace(local_path)
+        return _restore_backup_file(
+            filename,
+            local_path,
+            payload,
+            request,
+            db,
+            current,
+            source="google_drive",
+        )
+    except HTTPException:
+        raise
+    except GoogleDriveError as exc:
+        raise HTTPException(502, str(exc))
+    except Exception as exc:
+        logger.exception("Google Drive restore failed")
+        raise HTTPException(502, f"تعذر استعادة النسخة من Google Drive: {str(exc)[:300]}")
+
+
 @router.get("/download/{filename}")
 def download(filename: str, _u=Depends(require_admin)):
     if not _valid_name(filename):
@@ -610,50 +756,5 @@ class RestorePayload(BaseModel):
 @router.post("/restore/{filename}")
 def restore(filename: str, payload: RestorePayload,
             request: Request, db=Depends(get_db), current=Depends(require_admin)):
-    if not _valid_name(filename):
-        raise HTTPException(400, "اسم ملف غير صحيح")
     fp = BACKUP_DIR / filename
-    if not fp.exists():
-        raise HTTPException(404, "الملف غير موجود")
-    if payload.confirm != "RESTORE_DATABASE":
-        raise HTTPException(400, "عبارة التأكيد غير صحيحة")
-    if not verify_password(payload.current_password, current["password_hash"]):
-        raise HTTPException(401, "كلمة المرور غير صحيحة")
-    if not filename.endswith(".json.gz"):
-        raise HTTPException(400, "الاستعادة متاحة فقط لملفات .json.gz")
-
-    # Create safety backup first
-    safety_name = "FAILED"
-    try:
-        safety_name = _do_backup(db, trigger="safety").name
-    except Exception: pass
-
-    try:
-        with gzip.open(str(fp), "rt", encoding="utf-8") as fh:
-            backup = json.load(fh)
-    except Exception as exc:
-        raise HTTPException(400, f"تعذّر قراءة ملف النسخة الاحتياطية: {exc}")
-
-    col_data = backup.get("data", {})
-    try:
-        restored, documents_restored, failures = _restore_collections(db, col_data)
-    except Exception as exc:
-        raise HTTPException(400, f"بيانات النسخة غير صالحة: {exc}")
-    if failures:
-        raise HTTPException(
-            500,
-            "تعذّرت استعادة بعض مجموعات البيانات: " + ", ".join(failures)
-            + f". تم إنشاء نسخة الأمان: {safety_name}",
-        )
-
-    log_action(db, current["_id"], "restore_success", "system", None,
-               after={"file": filename, "safety_backup": safety_name,
-                       "collections_restored": restored,
-                       "documents_restored": documents_restored}, request=request)
-    return {
-        "detail": "✅ تمت استعادة جميع بيانات النظام بنجاح — يرجى تسجيل الدخول من جديد",
-        "restored_from": filename,
-        "collections_restored": restored,
-        "documents_restored": documents_restored,
-        "safety_backup_created": safety_name,
-    }
+    return _restore_backup_file(filename, fp, payload, request, db, current)

@@ -9,10 +9,10 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import time
 import uuid
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import requests
 
@@ -210,6 +210,37 @@ class GoogleDriveClient:
         )
         self._raise(response, f"تعذر رفع النسخة {filepath.name} إلى Google Drive")
         return response.json()
+
+    def list_backup_files(self, folder_id: str | None = None) -> list[dict[str, Any]]:
+        """List only database backup archives from the dedicated backup folder."""
+        folder = {"id": folder_id} if folder_id else self.ensure_backup_folder()
+        response = self.request(
+            "/drive/v3/files",
+            params={
+                "q": f"'{folder['id']}' in parents and trashed = false",
+                "pageSize": 100,
+                "orderBy": "modifiedTime desc",
+                "fields": "files(id,name,mimeType,size,modifiedTime,webViewLink,parents)",
+            },
+        )
+        self._raise(response, "تعذر تحميل نسخ Google Drive")
+        files = response.json().get("files", [])
+        return [
+            file
+            for file in files
+            if file.get("name", "").startswith("market_db_")
+            and file.get("name", "").endswith(".json.gz")
+        ]
+
+    def download_file(self, file_id: str) -> bytes:
+        """Download a Drive file after the caller has verified its folder."""
+        response = self.request(
+            f"/drive/v3/files/{quote(file_id, safe='')}",
+            params={"alt": "media"},
+            timeout=120,
+        )
+        self._raise(response, "تعذر تنزيل النسخة من Google Drive")
+        return response.content
 
 
 def upload_backup(filepath: Path, state_file: Path) -> dict[str, Any]:
