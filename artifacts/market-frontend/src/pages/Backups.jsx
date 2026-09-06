@@ -61,6 +61,7 @@ export default function Backups() {
   const [localInterval, setLocalInterval] = useState(2);
   const [midnightOn,    setMidnightOn]    = useState(true);
   const [retention,     setRetention]     = useState(30);
+  const [driveEnabled,  setDriveEnabled]  = useState(false);
 
   // restore dialog
   const [restoreOf,      setRestoreOf]      = useState(null);
@@ -87,6 +88,7 @@ export default function Backups() {
       setLocalInterval(s.local_interval_hours ?? 2);
       setMidnightOn(s.daily_midnight ?? true);
       setRetention(s.retention_count ?? 30);
+      setDriveEnabled(Boolean(s.drive_enabled));
     } catch (e) {
       toast({ title: 'خطأ في التحميل', description: formatApiError(e), variant: 'destructive' });
     }
@@ -166,7 +168,7 @@ export default function Backups() {
         local_interval_hours: localInterval,
         daily_midnight: midnightOn,
         retention_count: retention,
-        drive_enabled: settings?.drive_enabled ?? false,
+        drive_enabled: driveEnabled,
         drive_interval_hours: settings?.drive_interval_hours ?? 4,
       });
       toast({ title: '✅ تم حفظ الإعدادات' });
@@ -315,18 +317,26 @@ export default function Backups() {
       </div>
 
       {/* ── Google Drive card ── */}
-      <Card className="border-2 border-dashed border-slate-300 bg-slate-50/50">
+      <Card className={`border-2 ${status?.drive_enabled ? 'border-emerald-200 bg-emerald-50/60' : 'border-dashed border-slate-300 bg-slate-50/50'}`}>
         <CardContent className="p-5 flex items-center gap-4">
           <div className="w-10 h-10 bg-white rounded-xl border border-slate-200 flex items-center justify-center shadow-sm flex-shrink-0">
-            <Cloud className="w-5 h-5 text-slate-400" />
+            <Cloud className={`w-5 h-5 ${status?.drive_enabled ? 'text-emerald-600' : 'text-slate-400'}`} />
           </div>
           <div className="flex-1 min-w-0">
-            <p className="font-bold text-slate-700">Google Drive — غير مربوط</p>
+            <p className={`font-bold ${status?.drive_enabled ? 'text-emerald-800' : 'text-slate-700'}`}>
+              Google Drive — {status?.drive_enabled ? 'مربوط ومفعّل' : 'غير مفعّل'}
+            </p>
             <p className="text-sm text-slate-500 mt-0.5">
-              لتفعيل الرفع التلقائي إلى Google Drive، يرجى تفعيل التكامل من لوحة Replit ثم ضبط الإعدادات.
+              {status?.drive_enabled
+                ? `المجلد: ${status.drive_folder_name || 'Mini Market Backups'} • تم رفع ${status.drive_uploaded_count ?? 0} نسخة`
+                : 'فعّل الرفع السحابي من إعدادات النسخ لحماية البيانات خارج الخادم.'}
             </p>
           </div>
-          <Badge className="bg-slate-100 text-slate-500 border border-slate-300 flex-shrink-0">قريباً</Badge>
+          <Badge className={status?.drive_enabled
+            ? 'bg-emerald-100 text-emerald-700 border border-emerald-300 flex-shrink-0'
+            : 'bg-slate-100 text-slate-500 border border-slate-300 flex-shrink-0'}>
+            {status?.drive_enabled ? 'مفعّل' : 'غير مفعّل'}
+          </Badge>
         </CardContent>
       </Card>
 
@@ -337,7 +347,7 @@ export default function Backups() {
             <h3 className="font-bold text-slate-800 mb-4 flex items-center gap-2">
               <Settings className="w-4 h-4 text-blue-600" /> إعدادات الجدولة التلقائية
             </h3>
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-5">
               {/* Local interval */}
               <div>
                 <Label className="text-sm font-semibold text-slate-700 mb-2 block">
@@ -411,6 +421,33 @@ export default function Backups() {
                 </div>
                 <p className="text-xs text-slate-400 mt-1.5">
                   النسخ الأقدم تُحذف تلقائياً عند تجاوز الحد
+                </p>
+              </div>
+
+              {/* Google Drive */}
+              <div>
+                <Label className="text-sm font-semibold text-slate-700 mb-2 block">
+                  النسخ السحابية
+                </Label>
+                <button
+                  onClick={() => setDriveEnabled(!driveEnabled)}
+                  className={`w-full rounded-lg border-2 px-4 py-3 flex items-center gap-3 transition-all
+                    ${driveEnabled
+                      ? 'bg-emerald-50 border-emerald-300 text-emerald-800'
+                      : 'bg-slate-50 border-slate-200 text-slate-500'
+                    }`}
+                >
+                  <div className={`w-10 h-6 rounded-full relative transition-colors flex-shrink-0
+                    ${driveEnabled ? 'bg-emerald-600' : 'bg-slate-300'}`}>
+                    <div className={`w-5 h-5 bg-white rounded-full shadow absolute top-0.5 transition-all
+                      ${driveEnabled ? 'right-0.5' : 'left-0.5'}`} />
+                  </div>
+                  <span className="font-semibold text-sm">
+                    {driveEnabled ? 'مفعّل — Google Drive' : 'معطّل'}
+                  </span>
+                </button>
+                <p className="text-xs text-slate-400 mt-1.5">
+                  تُرفع كل نسخة تلقائياً إلى مجلد النسخ السحابية
                 </p>
               </div>
             </div>
@@ -522,8 +559,22 @@ export default function Backups() {
                     </td>
                     <td className="px-4 py-3 text-center text-xs text-slate-600">{fmtDate(b.created_at)}</td>
                     <td className="px-4 py-3 text-center">
-                      <span className="flex items-center justify-center gap-1 text-xs text-slate-400">
-                        <CloudOff className="w-3.5 h-3.5" /> غير مربوط
+                      <span className={`flex items-center justify-center gap-1 text-xs ${
+                        b.drive_status === 'uploaded'
+                          ? 'text-emerald-600'
+                          : b.drive_status === 'error'
+                            ? 'text-rose-600'
+                            : b.drive_status === 'pending'
+                              ? 'text-amber-600'
+                              : 'text-slate-400'
+                      }`}>
+                        {b.drive_status === 'uploaded'
+                          ? <><Cloud className="w-3.5 h-3.5" /> مرفوعة</>
+                          : b.drive_status === 'error'
+                            ? <><CloudOff className="w-3.5 h-3.5" /> فشل الرفع</>
+                            : b.drive_status === 'pending'
+                              ? <><Cloud className="w-3.5 h-3.5" /> بانتظار الرفع</>
+                              : <><CloudOff className="w-3.5 h-3.5" /> غير مفعّل</>}
                       </span>
                     </td>
                     <td className="px-4 py-3">
@@ -564,7 +615,8 @@ export default function Backups() {
 
       {/* ── Info footer ── */}
       <p className="text-xs text-slate-400 text-center">
-        النسخ محفوظة في <code className="bg-slate-100 px-1 rounded">data/backups/</code> داخل الخادم
+         النسخ محفوظة محلياً في <code className="bg-slate-100 px-1 rounded">data/backups/</code>
+         {status?.drive_enabled ? ' وتُرفع تلقائياً إلى Google Drive' : ' داخل الخادم'}
         • يُحتفظ بآخر {status?.retention_count ?? 30} نسخة • تحديث تلقائي كل 30 ثانية
       </p>
     </div>

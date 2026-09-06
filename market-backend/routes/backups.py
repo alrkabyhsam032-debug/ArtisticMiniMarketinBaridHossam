@@ -1,4 +1,4 @@
-"""Backup management — automated APScheduler + manual trigger + Google Drive stub."""
+"""Backup management — local retention plus optional Google Drive mirroring."""
 import gzip
 import json
 import os
@@ -21,6 +21,7 @@ from models import new_id
 from utils.deps import require_admin
 from utils.audit import log_action
 from utils.security import verify_password
+from utils.google_drive import GoogleDriveError, upload_backup
 
 router = APIRouter(prefix="/api/admin/backups", tags=["backups"])
 logger = logging.getLogger(__name__)
@@ -30,6 +31,7 @@ _DEFAULT_DIR = Path(os.environ.get("BACKUP_DIR", "")).expanduser() \
                if os.environ.get("BACKUP_DIR") else None
 BACKUP_DIR   = _DEFAULT_DIR or Path(__file__).resolve().parent.parent / "data" / "backups"
 SETTINGS_FILE = Path(__file__).resolve().parent.parent / "data" / "backup_settings.json"
+DRIVE_STATE_FILE = Path(__file__).resolve().parent.parent / "data" / "drive_backup_state.json"
 
 DEFAULT_SETTINGS: dict = {
     "local_interval_hours": 2,
@@ -43,6 +45,8 @@ DEFAULT_SETTINGS: dict = {
 _scheduler: Optional[BackgroundScheduler] = None
 _last_auto_backup: Optional[str] = None
 _last_auto_error: Optional[str] = None
+_last_drive_upload: Optional[str] = None
+_last_drive_error: Optional[str] = None
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -59,6 +63,84 @@ def _load_settings() -> dict:
 def _save_settings(settings: dict):
     SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
     SETTINGS_FILE.write_text(json.dumps(settings, ensure_ascii=False, indent=2))
+
+
+def _load_drive_state() -> dict:
+    try:
+        if DRIVE_STATE_FILE.exists():
+            value = json.loads(DRIVE_STATE_FILE.read_text(encoding="utf-8"))
+            if isinstance(value, dict):
+                return value
+    except (OSError, ValueError):
+        pass
+    return {"uploads": {}}
+
+
+def _save_drive_state(state: dict) -> None:
+    DRIVE_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temporary = DRIVE_STATE_FILE.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temporary.replace(DRIVE_STATE_FILE)
+
+
+def _drive_upload_record(name: str) -> Optional[dict]:
+    record = _load_drive_state().get("uploads", {}).get(name)
+    return record if isinstance(record, dict) else None
+
+
+def _upload_backup_to_drive(filepath: Path) -> bool:
+    """Mirror a local backup; local success is never undone by Drive failure."""
+    global _last_drive_upload, _last_drive_error
+    state = _load_drive_state()
+    uploads = state.setdefault("uploads", {})
+    try:
+        result = upload_backup(filepath, DRIVE_STATE_FILE)
+        state = _load_drive_state()
+        state.setdefault("uploads", {})[filepath.name] = {
+            "status": "uploaded",
+            "uploaded_at": datetime.now(timezone.utc).isoformat(),
+            "file_id": result.get("id"),
+            "web_view_link": result.get("webViewLink"),
+            "size": filepath.stat().st_size,
+        }
+        _save_drive_state(state)
+        _last_drive_upload = datetime.now(timezone.utc).isoformat()
+        _last_drive_error = None
+        logger.info("Backup uploaded to Google Drive: %s", filepath.name)
+        return True
+    except Exception as exc:
+        uploads[filepath.name] = {
+            "status": "error",
+            "last_attempt_at": datetime.now(timezone.utc).isoformat(),
+            "error": str(exc)[:500],
+            "size": filepath.stat().st_size if filepath.exists() else 0,
+        }
+        _save_drive_state(state)
+        _last_drive_error = str(exc)[:500]
+        logger.error("Google Drive upload failed for %s: %s", filepath.name, exc)
+        return False
+
+
+def _sync_pending_to_drive() -> dict[str, int]:
+    cfg = _load_settings()
+    if not cfg.get("drive_enabled"):
+        return {"uploaded": 0, "failed": 0, "pending": 0}
+    state = _load_drive_state()
+    uploads = state.get("uploads", {})
+    uploaded = failed = pending = 0
+    for filepath in reversed(_list_backups()):
+        record = uploads.get(filepath.name, {})
+        if record.get("status") == "uploaded":
+            continue
+        pending += 1
+        if _upload_backup_to_drive(filepath):
+            uploaded += 1
+        else:
+            failed += 1
+    return {"uploaded": uploaded, "failed": failed, "pending": pending}
 
 
 def _human(n: float) -> str:
@@ -202,6 +284,9 @@ def _do_backup(db, trigger: str = "manual") -> Path:
         try: old.unlink()
         except Exception: pass
 
+    if cfg.get("drive_enabled"):
+        _upload_backup_to_drive(filepath)
+
     if trigger not in ("manual", "safety"):
         _last_auto_backup = datetime.now(timezone.utc).isoformat()
         _last_auto_error  = None
@@ -263,6 +348,13 @@ def _auto_backup_job(trigger: str = "auto"):
         logger.error("Auto backup (%s) failed: %s", trigger, exc)
 
 
+def _drive_sync_job():
+    try:
+        _sync_pending_to_drive()
+    except Exception as exc:
+        logger.error("Google Drive sync failed: %s", exc)
+
+
 # ── Scheduler lifecycle (called from server.py) ───────────────────────────────
 
 def _next_run(job_id: str) -> Optional[str]:
@@ -313,6 +405,14 @@ def _add_jobs(cfg: dict):
             replace_existing=True,
             misfire_grace_time=600,
         )
+    if cfg.get("drive_enabled"):
+        _scheduler.add_job(
+            _drive_sync_job,
+            trigger=IntervalTrigger(hours=int(cfg.get("drive_interval_hours", 4))),
+            id="drive_sync",
+            replace_existing=True,
+            misfire_grace_time=600,
+        )
 
 
 def _reschedule(cfg: dict):
@@ -338,6 +438,23 @@ def _reschedule(cfg: dict):
     else:
         try: _scheduler.remove_job("daily_midnight")
         except Exception: pass
+    if cfg.get("drive_enabled"):
+        try:
+            _scheduler.reschedule_job(
+                "drive_sync",
+                trigger=IntervalTrigger(hours=int(cfg.get("drive_interval_hours", 4))),
+            )
+        except Exception:
+            _scheduler.add_job(
+                _drive_sync_job,
+                trigger=IntervalTrigger(hours=int(cfg.get("drive_interval_hours", 4))),
+                id="drive_sync",
+                replace_existing=True,
+                misfire_grace_time=600,
+            )
+    else:
+        try: _scheduler.remove_job("drive_sync")
+        except Exception: pass
 
 
 # ── Settings endpoints ────────────────────────────────────────────────────────
@@ -361,6 +478,8 @@ def update_settings(payload: BackupSettingsIn, _u=Depends(require_admin)):
     _save_settings(cfg)
     try: _reschedule(cfg)
     except Exception as e: logger.warning("Reschedule failed: %s", e)
+    if cfg.get("drive_enabled"):
+        _sync_pending_to_drive()
     return cfg
 
 
@@ -370,6 +489,12 @@ def update_settings(payload: BackupSettingsIn, _u=Depends(require_admin)):
 def get_status(_u=Depends(require_admin)):
     files = _list_backups()
     cfg   = _load_settings()
+    drive_state = _load_drive_state()
+    drive_uploads = drive_state.get("uploads", {})
+    uploaded_count = sum(
+        1 for record in drive_uploads.values()
+        if isinstance(record, dict) and record.get("status") == "uploaded"
+    )
     sched = _scheduler is not None and _scheduler.running
     base  = {
         "scheduler_running": sched,
@@ -380,6 +505,10 @@ def get_status(_u=Depends(require_admin)):
         "schedule": f"كل {cfg.get('local_interval_hours', 2)} ساعة تلقائياً",
         "retention_count": cfg.get("retention_count", 30),
         "drive_enabled": cfg.get("drive_enabled", False),
+        "drive_folder_name": drive_state.get("folder_name", "Mini Market Backups"),
+        "drive_uploaded_count": uploaded_count,
+        "last_drive_upload": _last_drive_upload,
+        "last_drive_error": _last_drive_error,
     }
     if not files:
         return {**base, "count": 0, "total_size": 0, "total_size_human": "0 B", "latest": None}
@@ -400,6 +529,8 @@ def get_status(_u=Depends(require_admin)):
 
 @router.get("")
 def list_backups(_u=Depends(require_admin)):
+    cfg = _load_settings()
+    drive_uploads = _load_drive_state().get("uploads", {})
     return [
         {
             "name": f.name,
@@ -407,7 +538,11 @@ def list_backups(_u=Depends(require_admin)):
             "size_human": _human(f.stat().st_size),
             "created_at": datetime.fromtimestamp(f.stat().st_mtime, tz=timezone.utc).isoformat(),
             "trigger": _infer_trigger(f.name),
-            "drive_status": "not_configured",
+            "drive_status": (
+                drive_uploads.get(f.name, {}).get("status")
+                if isinstance(drive_uploads.get(f.name), dict)
+                else None
+            ) or ("pending" if cfg.get("drive_enabled") else "disabled"),
         }
         for f in _list_backups()
     ]
@@ -422,12 +557,24 @@ def run_now(request: Request, db=Depends(get_db), current=Depends(require_admin)
         sh  = _human(fp.stat().st_size)
         log_action(db, current["_id"], "backup_run", "system", None,
                    after={"file": fp.name, "size": sh}, request=request)
-        return {"detail": f"✅ النسخة الاحتياطية تمت بنجاح — {sh}",
-                "file": fp.name, "size": sh}
+        drive_record = _drive_upload_record(fp.name)
+        return {
+            "detail": f"✅ النسخة الاحتياطية تمت بنجاح — {sh}",
+            "file": fp.name,
+            "size": sh,
+            "drive_status": drive_record.get("status") if drive_record else "disabled",
+        }
     except Exception as exc:
         log_action(db, current["_id"], "backup_failed", "system", None,
                    after={"error": str(exc)[:400]}, request=request)
         raise HTTPException(500, f"فشل إنشاء النسخة الاحتياطية: {exc}")
+
+
+@router.post("/drive/sync")
+def sync_drive(_u=Depends(require_admin)):
+    if not _load_settings().get("drive_enabled"):
+        raise HTTPException(409, "رفع Google Drive غير مفعّل")
+    return _sync_pending_to_drive()
 
 
 @router.get("/download/{filename}")

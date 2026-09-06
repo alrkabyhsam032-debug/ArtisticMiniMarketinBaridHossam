@@ -2,6 +2,6 @@
   "local_interval_hours": 1,
   "daily_midnight": true,
   "retention_count": 100,
-  "drive_enabled": false,
+  "drive_enabled": true,
   "drive_interval_hours": 4
 }
