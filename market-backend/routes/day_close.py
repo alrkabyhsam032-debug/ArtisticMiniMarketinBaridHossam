@@ -25,7 +25,7 @@ def _build_preview(db, target: _date) -> dict:
 
     # Sales total & cash portion
     sales_agg = list(db[C.sales].aggregate([
-        {"$match": {"created_at": {"$gte": start, "$lte": end},
+        {"$match": {"created_at": {"$gte": start, "$lt": end},
                     "status": "completed", "deleted_at": None}},
         {"$group": {
             "_id": "$payment_method",
@@ -41,7 +41,7 @@ def _build_preview(db, target: _date) -> dict:
 
     # Returns
     ret_agg = list(db[C.sale_returns].aggregate([
-        {"$match": {"created_at": {"$gte": start, "$lte": end},
+        {"$match": {"created_at": {"$gte": start, "$lt": end},
                     "status": "approved", "deleted_at": None}},
         {"$group": {"_id": "$return_type", "total": {"$sum": "$total"}}},
     ]))
@@ -51,7 +51,7 @@ def _build_preview(db, target: _date) -> dict:
     # Only cash movements affect the physical drawer. Keep all expense
     # methods in total_expenses for the operating summary.
     exp_agg = list(db[C.expenses].aggregate([
-        {"$match": {"created_at": {"$gte": start, "$lte": end},
+        {"$match": {"created_at": {"$gte": start, "$lt": end},
                     "deleted_at": None,
                     "$or": [{"payment_method": "cash"},
                             {"payment_method": {"$exists": False}}]}},
@@ -59,14 +59,14 @@ def _build_preview(db, target: _date) -> dict:
     ]))
     expenses_paid = float(exp_agg[0]["total"]) if exp_agg else 0.0
     all_exp_agg = list(db[C.expenses].aggregate([
-        {"$match": {"created_at": {"$gte": start, "$lte": end}, "deleted_at": None}},
+        {"$match": {"created_at": {"$gte": start, "$lt": end}, "deleted_at": None}},
         {"$group": {"_id": None, "total": {"$sum": "$amount"}}},
     ]))
     total_expenses = float(all_exp_agg[0]["total"]) if all_exp_agg else 0.0
 
     # Supplier payments
     sp_agg = list(db[C.supplier_payments].aggregate([
-        {"$match": {"created_at": {"$gte": start, "$lte": end},
+        {"$match": {"created_at": {"$gte": start, "$lt": end},
                     "$or": [{"payment_method": "cash"}, {"payment_method": {"$exists": False}}]}},
         {"$group": {"_id": None, "total": {"$sum": "$amount"}}},
     ]))
@@ -74,7 +74,7 @@ def _build_preview(db, target: _date) -> dict:
 
     # Customer receipts
     cp_agg = list(db[C.customer_payments].aggregate([
-        {"$match": {"created_at": {"$gte": start, "$lte": end},
+        {"$match": {"created_at": {"$gte": start, "$lt": end},
                     "$or": [{"payment_method": "cash"}, {"method": "cash"},
                             {"payment_method": {"$exists": False}, "method": {"$exists": False}}]}},
         {"$group": {"_id": None, "total": {"$sum": "$amount"}}},

@@ -205,6 +205,7 @@ def _profit_breakdown(db, start, end, cashier_id=None):
         "net_cogs": round(net_cogs, 2),
         "profit": round(net_sales - net_cogs, 2),
         "invoice_count": len(sales),
+        "line_count": len(items),
         "return_count": return_count,
         "missing_cost_lines": missing_cost_lines,
         "cost_data_complete": missing_cost_lines == 0,
@@ -471,6 +472,7 @@ def manager_dashboard(db = Depends(get_db), _u = Depends(require_manager)):
     ret_by_type_today = _sum_returns_by_type(db, today_start, today_end)
     cash_ret_today = ret_by_type_today.get("cash", {}).get("total", 0.0)
     credit_ret_today = ret_by_type_today.get("credit", {}).get("total", 0.0)
+    returns_by_sale_method_today = _return_payment_breakdown(db, today_start, today_end)
     gross_today = sum_sales(today_start, today_end)
     gross_week  = sum_sales(week_start, today_end)
     gross_month = sum_sales(month_start, month_end)
@@ -501,8 +503,8 @@ def manager_dashboard(db = Depends(get_db), _u = Depends(require_manager)):
         "net_week":  round(gross_week  - ret_week,  2),
         "net_month": round(gross_month - ret_month, 2),
         "net_year":  round(gross_year  - ret_year,  2),
-        "net_today_cash":   round(max(0.0, today_cash_total   - cash_ret_today),   2),
-        "net_today_credit": round(max(0.0, today_credit_total - credit_ret_today), 2),
+        "net_today_cash":   round(today_cash_total - returns_by_sale_method_today.get("cash", 0.0), 2),
+        "net_today_credit": round(today_credit_total - returns_by_sale_method_today.get("credit", 0.0), 2),
     }
 
     # Profit = net sales - net COGS. Each period has a full reconciliation
@@ -647,13 +649,43 @@ def manager_dashboard(db = Depends(get_db), _u = Depends(require_manager)):
         "debtors_count": len(top_debtors),
         "top_debtors": top_debtors,
     }
+    supplier_balances = []
+    for supplier in db[C.suppliers].find({"deleted_at": None}, {"_id": 1, "name": 1}):
+        invoice_due = 0.0
+        for purchase in db[C.purchases].find(
+            {"supplier_id": supplier["_id"], "deleted_at": None},
+            {"total": 1, "paid_amount": 1, "payment_method": 1},
+        ):
+            total = float(purchase.get("total", 0) or 0)
+            paid = float(purchase.get("paid_amount", 0) or 0)
+            if paid <= 0 and purchase.get("payment_method", "credit") != "credit":
+                paid = total
+            invoice_due += total - paid
+        later_paid = sum(
+            float(payment.get("amount", 0) or 0)
+            for payment in db[C.supplier_payments].find(
+                {"supplier_id": supplier["_id"]}, {"amount": 1}
+            )
+        )
+        returns = sum(
+            float(ret.get("total", 0) or 0)
+            for ret in db[C.supplier_returns].find(
+                {"supplier_id": supplier["_id"]}, {"total": 1}
+            )
+        )
+        balance = invoice_due - later_paid - returns
+        if balance > 0:
+            supplier_balances.append({
+                "id": supplier["_id"],
+                "name": supplier["name"],
+                "balance": round(balance, 2),
+            })
     top_suppliers = sorted(
         [{"id": s["_id"], "name": s["name"], "balance": float(s.get("balance", 0))}
-         for s in db[C.suppliers].find({"deleted_at": None, "balance": {"$gt": 0}},
-                                        {"_id": 1, "name": 1, "balance": 1})],
+         for s in supplier_balances],
         key=lambda x: x["balance"], reverse=True,
     )[:10]
-    suppliers_total_due = round(sum(s["balance"] for s in top_suppliers), 2)
+    suppliers_total_due = round(sum(s["balance"] for s in supplier_balances), 2)
     suppliers = {
         "count": db[C.suppliers].count_documents({"deleted_at": None}),
         "balance_total": suppliers_total_due,

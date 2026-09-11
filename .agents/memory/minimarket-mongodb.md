@@ -7,4 +7,4 @@ Neon PostgreSQL is intended to be selected whenever the secure `NEON_DATABASE_UR
 
 **Why:** ALLOW_MONGOMOCK must be explicit so production misconfigurations don't silently lose data.
 
-**How to apply:** Keep `ALLOW_MONGOMOCK=true` only in development. Production is configured with `ALLOW_MONGOMOCK=false`; verify `/api/health` reports `db=neon-postgres` and `persistent=true` after deployment.
+**How to apply:** Keep `ALLOW_MONGOMOCK=true` only in development. The preview workflow may need the development variable enabled explicitly; production remains `ALLOW_MONGOMOCK=false`. Verify `/api/health` reports `db=neon-postgres` and `persistent=true` after deployment.

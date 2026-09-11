@@ -13,7 +13,7 @@ Also supports:
 """
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 from typing import List, Optional
 
 from database import get_db, C
@@ -36,7 +36,12 @@ class SaleReturnCreate(BaseModel):
     sale_id: str
     items: List[ReturnItemIn] = Field(..., min_length=1)
     reason: Optional[str] = None
-    return_type: str = Field(default="cash", description="cash | credit")
+    return_type: str = Field(
+        default="cash",
+        description="cash | credit",
+        validation_alias=AliasChoices("return_type", "refund_method"),
+        serialization_alias="return_type",
+    )
 
 
 class RejectPayload(BaseModel):
