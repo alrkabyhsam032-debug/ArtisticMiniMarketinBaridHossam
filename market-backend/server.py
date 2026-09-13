@@ -13,6 +13,8 @@ import os
 import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.staticfiles import StaticFiles
 from datetime import datetime, timezone
 
 from database import db, C, DB_BACKEND, USING_MOCK_MONGO, init_indexes
@@ -25,6 +27,13 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Mini Market Management System", version="1.0.0")
+
+FRONTEND_DIR = Path(
+    os.environ.get(
+        "FRONTEND_DIR",
+        str(ROOT_DIR.parent / "artifacts" / "market-frontend" / "dist" / "public"),
+    )
+).expanduser()
 
 app.add_middleware(
     CORSMiddleware,
@@ -164,3 +173,20 @@ def on_shutdown():
         stop_scheduler()
     except Exception:
         pass
+
+
+class SPAStaticFiles(StaticFiles):
+    """Serve React routes through index.html when opened directly."""
+
+    async def get_response(self, path, scope):
+        try:
+            return await super().get_response(path, scope)
+        except StarletteHTTPException as exc:
+            if exc.status_code == 404:
+                return await super().get_response("index.html", scope)
+            raise
+
+
+if FRONTEND_DIR.is_dir():
+    app.mount("/", SPAStaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
+    logger.info("Serving frontend from %s", FRONTEND_DIR)
