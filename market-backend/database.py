@@ -1,8 +1,8 @@
-"""MongoDB connection module — replaces SQLAlchemy/PostgreSQL.
+"""Database connection module for hosted and offline editions.
 
 Uses PyMongo (sync) so existing route functions keep their `def` signatures.
-Falls back to mongomock (in-memory) when the real MongoDB is unreachable,
-so the app works for development/demo without an external database.
+The hosted edition prefers Neon PostgreSQL.  The Windows edition uses an
+explicit file-backed Mongo-compatible store and never needs a network.
 """
 import os
 import logging
@@ -16,6 +16,11 @@ from pymongo.database import Database
 MONGO_URL = os.environ.get("MONGO_URL", "")
 NEON_DATABASE_URL = os.environ.get("NEON_DATABASE_URL", "")
 DB_NAME = os.environ.get("DB_NAME", "market_db")
+OFFLINE_MODE = os.environ.get("OFFLINE_MODE", "false").lower() in ("1", "true", "yes")
+OFFLINE_DB_PATH = os.environ.get(
+    "OFFLINE_DB_PATH",
+    str((__import__("pathlib").Path.home() / "MiniMarketData" / "market_db.json")),
+)
 # Only fall back to in-memory mongomock when explicitly allowed (dev/demo mode).
 # In production, a bad MONGO_URL must fail fast rather than silently lose data.
 _ALLOW_MONGOMOCK = os.environ.get("ALLOW_MONGOMOCK", "false").lower() in ("1", "true", "yes")
@@ -24,9 +29,17 @@ _client = None
 db: Database = None
 USING_MOCK_MONGO = False
 USING_NEON_POSTGRES = False
+USING_OFFLINE_FILE = False
 
 
-if NEON_DATABASE_URL:
+if OFFLINE_MODE:
+    from offline_store import PersistentMongoClient
+
+    _client = PersistentMongoClient(OFFLINE_DB_PATH, DB_NAME)
+    db = _client[DB_NAME]
+    USING_OFFLINE_FILE = True
+    logger.info("✅ Using persistent offline database: %s", OFFLINE_DB_PATH)
+elif NEON_DATABASE_URL:
     from postgres_store import PostgresStore
 
     try:
@@ -82,7 +95,7 @@ def _use_mock_mongo():
     client = mongomock.MongoClient(uuidRepresentation="standard", tz_aware=True)
     return client
 
-if not USING_NEON_POSTGRES:
+if not USING_NEON_POSTGRES and not USING_OFFLINE_FILE:
     try:
         _client = _try_real_mongo()
         logger.info("✅ Connected to real MongoDB")
@@ -97,10 +110,18 @@ if not USING_NEON_POSTGRES:
             )
             raise
 
-if not USING_NEON_POSTGRES:
+if not USING_NEON_POSTGRES and not USING_OFFLINE_FILE:
     db = _client[DB_NAME]
 
-DB_BACKEND = "neon-postgres" if USING_NEON_POSTGRES else ("mongomock" if USING_MOCK_MONGO else "mongodb")
+DB_BACKEND = (
+    "neon-postgres"
+    if USING_NEON_POSTGRES
+    else "offline-file"
+    if USING_OFFLINE_FILE
+    else "mongomock"
+    if USING_MOCK_MONGO
+    else "mongodb"
+)
 
 
 def get_db() -> Database:
